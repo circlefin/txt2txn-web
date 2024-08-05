@@ -38,7 +38,7 @@ jobs:
     - name: Use Node.js
       uses: actions/setup-node@v2
       with:
-        node-version: '14'
+        node-version: '20'
         
     - name: Install dependencies
       run: npm i
@@ -49,6 +49,6 @@ jobs:
       uses: circlefin/circle-public-github-workflows/.github/workflows/pr-scan.yaml@v1
       
   release-sbom: 
+      needs: install
       if: github.event_name == 'push'
       uses: circlefin/circle-public-github-workflows/.github/workflows/attach-release-assets.yaml@v1
-      
