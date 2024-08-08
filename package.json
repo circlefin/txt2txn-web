@@ -12,7 +12,7 @@
     "lint": "next lint && npx prettier --check \"{__tests__,components,pages,styles}/**/*.{ts,tsx,js,jsx}\" && npx tsc --noEmit"
   },
   "dependencies": {
-    "@cowprotocol/cow-sdk": "^5.3.3",
+    "@cowprotocol/cow-sdk": "^5.4.1-RC.0",
     "@headlessui/react": "^1.7.3",
     "@heroicons/react": "^2.0.12",
     "@privy-io/react-auth": "^1.77.0",
