@@ -21,7 +21,36 @@
  * SPDX-License-Identifier: MIT
  */
 
+/**
+ * Baseline response headers.
+ *
+ * This app asks the user to sign blockchain transactions, so framing and
+ * MIME-sniffing protections are not cosmetic: without them the UI can be
+ * embedded and overlaid by a third-party page (clickjacking a signature) and
+ * uploaded/echoed content can be re-interpreted as HTML by the browser.
+ *
+ * `Content-Security-Policy` is deliberately not set here — a correct policy has
+ * to enumerate this app's wallet/RPC endpoints, and a wrong one silently breaks
+ * signing. It should be added per deployment.
+ */
+const securityHeaders = [
+  { key: "X-Frame-Options", value: "DENY" },
+  { key: "X-Content-Type-Options", value: "nosniff" },
+  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  {
+    key: "Permissions-Policy",
+    value: "camera=(), microphone=(), geolocation=()",
+  },
+  {
+    key: "Strict-Transport-Security",
+    value: "max-age=63072000; includeSubDomains",
+  },
+];
+
 /** @type {import('next').NextConfig} */
 module.exports = {
   reactStrictMode: true,
+  async headers() {
+    return [{ source: "/:path*", headers: securityHeaders }];
+  },
 };

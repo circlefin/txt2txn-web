@@ -54,7 +54,9 @@ const decimalConverter: { [key: number]: { [key: string]: number } } = {
 export const chainToUrl: Record<string, string> = {
   sepolia: "https://sepolia.etherscan.io/tx/",
   base: "https://basescan.org/tx/",
-  mainnet: "https://etherscan.io/tx",
+  // Trailing slash added: without it every mainnet explorer link was built as
+  // ".../txHASH" and resolved to a 404.
+  mainnet: "https://etherscan.io/tx/",
 };
 
 const supportedChains: { [key: string]: number } = {
@@ -63,10 +65,13 @@ const supportedChains: { [key: string]: number } = {
   base: 8453,
 };
 
-// Free mainnet RPC, used for ENS resolution
-const mainnetProvider = new ethers.providers.JsonRpcProvider(
-  "https://rpc.ankr.com/eth"
-);
+// Mainnet RPC used for ENS resolution. Configurable so a deployment can point at
+// its own provider instead of a shared public endpoint that sees every address
+// this app resolves (and can rate-limit or answer incorrectly).
+const MAINNET_RPC_URL =
+  process.env.NEXT_PUBLIC_MAINNET_RPC_URL ?? "https://rpc.ankr.com/eth";
+
+const mainnetProvider = new ethers.providers.JsonRpcProvider(MAINNET_RPC_URL);
 
 const ERC20_ABI = [
   // Read-Only Functions
@@ -95,7 +100,6 @@ async function checkAllowanceAndApproveIfNecessary(
     ERC20_ABI,
     signer
   );
-  console.log(sellTokenContract);
 
   const existingAllowance: ethers.BigNumber = await sellTokenContract.allowance(
     await signer.getAddress(),
@@ -103,19 +107,17 @@ async function checkAllowanceAndApproveIfNecessary(
   );
   const sellAmountBn = ethers.BigNumber.from(requiredAmount);
   if (existingAllowance.gte(sellAmountBn)) {
-    console.log("existing allowance is sufficient");
-  } else {
-    const sellTokenSigner = sellTokenContract.connect(signer);
-    const tx = await await sellTokenSigner.approve(
-      targetContract,
-      ethers.constants.MaxUint256
-    );
-    console.log("Sending approval transaction...");
-    // Waiting for the transaction to be mined
-    const receipt = await tx.wait();
-    // The transaction is now on chain!
-    console.log(`Approval finalized in block ${receipt.blockNumber}`);
+    return;
   }
+
+  const sellTokenSigner = sellTokenContract.connect(signer);
+  // Approve exactly what this order needs rather than `MaxUint256`. An unlimited
+  // allowance survives the order and lets the spender move the user's entire
+  // balance at any later point, so a bug or compromise in the relayer is no
+  // longer bounded by the trade size.
+  const tx = await sellTokenSigner.approve(targetContract, sellAmountBn);
+  // Waiting for the transaction to be mined
+  await tx.wait();
 }
 
 export const abbreviateTransactionHash = (hash: string) => {
@@ -123,7 +125,10 @@ export const abbreviateTransactionHash = (hash: string) => {
   return `${hash.slice(0, 6)}...${hash.slice(-4)}`;
 };
 
-export const BACKEND_URL = "http://localhost:8000/";
+// Backend base URL. Hardcoding localhost meant every non-local deployment
+// silently talked to the user's own machine.
+export const BACKEND_URL =
+  process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000/";
 
 /**
  * Asynchronously waits for the specified number of milliseconds.
@@ -221,7 +226,10 @@ export async function sendOrder(
   }
 
   const amountDecimals = ethers.utils.parseUnits(amount, decimals).toString();
-  const slippage = 0.05;
+  // 5% slippage expressed in basis points so the calculation below stays in
+  // integer arithmetic.
+  const slippageBps = 500;
+  const BPS_DENOMINATOR = 10_000;
 
   const quoteRequest: OrderQuoteRequest = {
     sellToken: fromAsset,
@@ -246,9 +254,15 @@ export async function sendOrder(
 
   quote.feeAmount = "0";
   quote.sellAmount = amountDecimals;
-  quote.buyAmount = Math.round(
-    Number(quote.buyAmount) * (1 - slippage)
-  ).toString();
+  // Apply slippage with BigNumber. The previous
+  // `Math.round(Number(quote.buyAmount) * (1 - slippage))` routed an 18-decimal
+  // wei value through a float with 53 bits of mantissa, so the minimum buy
+  // amount the user signs was rounded at the ~1e-16 relative level — silently
+  // wrong by many wei, and outright lossy for large amounts.
+  quote.buyAmount = ethers.BigNumber.from(quote.buyAmount)
+    .mul(BPS_DENOMINATOR - slippageBps)
+    .div(BPS_DENOMINATOR)
+    .toString();
 
   const orderSigningResult = await OrderSigningUtils.signOrder(
     { ...quote, receiver: fromAddress },
@@ -267,9 +281,14 @@ export async function sendOrder(
   return await orderBookApi.sendOrder(orderObj);
 }
 
+/** Poll interval and overall bound for {@link waitForOrderStatus}. */
+const ORDER_POLL_INTERVAL_MS = 3000;
+const ORDER_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
 export async function waitForOrderStatus(
   orderId: string,
-  chain: string
+  chain: string,
+  timeoutMs: number = ORDER_POLL_TIMEOUT_MS
 ): Promise<OrderStatus> {
   const chainId = supportedChains[chain];
   if (chainId === undefined) {
@@ -277,10 +296,21 @@ export async function waitForOrderStatus(
   }
 
   const orderBookApi = new OrderBookApi({ chainId: chainId });
+  const deadline = Date.now() + timeoutMs;
   let orderStatus: OrderStatus = OrderStatus.OPEN;
-  while (orderStatus == OrderStatus.OPEN) {
-    // wait three seconds
-    await sleep(3000);
+
+  // Bounded polling. The previous `while (orderStatus == OrderStatus.OPEN)` loop
+  // had no exit condition other than the order leaving OPEN, so an order that
+  // never fills kept the caller (and its request handler) alive indefinitely.
+  while (orderStatus === OrderStatus.OPEN) {
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Timed out after ${Math.round(
+          timeoutMs / 1000
+        )}s waiting for order ${orderId} to leave the OPEN state.`
+      );
+    }
+    await sleep(ORDER_POLL_INTERVAL_MS);
     const enrichedOrder = await orderBookApi.getOrder(orderId);
     orderStatus = enrichedOrder.status;
   }
